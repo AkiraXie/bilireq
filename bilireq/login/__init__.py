@@ -1,16 +1,20 @@
 import asyncio
-import io
 from base64 import b64encode
+from io import BytesIO
 from typing import Optional, Union
 
+from qrcode.image.pure import PyPNGImage
+from qrcode.main import QRCode
+
 from .._typing import T_Auth
-from ..auth import Auth
+from ..auth import Auth, WebAuth
 from ..exceptions import ResponseCodeError
 from ..utils import get, post
 from .pwd_login import pwd_login as _pwd_login
 from .qrcode_login import get_qrcode_login_info, get_qrcode_login_result
 from .sms_login import send_sms
 from .sms_login import sms_login as _sms_login
+from .web_qrcode_login import get_web_qrcode_login_info, get_web_qrcode_login_url
 
 BASE_URL = "https://passport.bilibili.com/api/v2/oauth2/"
 
@@ -58,29 +62,57 @@ class Login:
     cid: int
     captcha_key: str
 
+    async def get_web_qrcode_url(self) -> str:
+        r = await get_web_qrcode_login_url()
+        self.auth_code = r["qrcode_key"]
+        self.qrcode_url = r["url"]
+        return self.qrcode_url
+
     async def get_qrcode_url(self) -> str:
         r = await get_qrcode_login_info()
         self.auth_code = r["auth_code"]
         self.qrcode_url = r["url"]
         return self.qrcode_url
 
-    async def get_qrcode(self, url: Optional[str] = None, print_=False, base64=False):
-        try:
-            import qrcode  # type: ignore
-        except ImportError:
-            raise ImportError("bilireq[qrcode] not installed.")
-        url = url or await self.get_qrcode_url()
-        qr = qrcode.QRCode()
+    async def get_qrcode(
+        self, url: Optional[str] = None, print_=False, base64=False, login_type="app"
+    ):
+        url = url or (
+            await self.get_qrcode_url()
+            if login_type == "app"
+            else await self.get_web_qrcode_url()
+        )
+        qr = QRCode()
         qr.add_data(url)
         if print_:
             qr.print_tty()
             return None
-        img = qr.make_image()
+        img = qr.make_image(image_factory=PyPNGImage)
+        buf = BytesIO()
+        img.save(buf)
         if not base64:
-            return img
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
+            return buf.getvalue()
         return b64encode(buf.getvalue()).decode()
+
+    async def web_qecode_login(self, auth_code=None, retry=-1, interval=1):
+        auth_code = auth_code or self.auth_code
+        while retry:
+            try:
+                auth = WebAuth()
+                resp = await get_web_qrcode_login_info(auth_code, cookies=auth.cookies)
+                if resp["code"] != 0:
+                    raise ResponseCodeError(
+                        code=resp["code"],
+                        msg=resp["message"],
+                        data=None,
+                    )
+                auth.refresh_token = resp["refresh_token"]
+                return auth
+            except ResponseCodeError as e:
+                if e.code != 86101 and e.code != 86090:
+                    raise
+            await asyncio.sleep(interval)
+            retry -= 1
 
     async def qrcode_login(self, auth_code=None, retry=-1, interval=1):
         auth_code = auth_code or self.auth_code
@@ -88,8 +120,7 @@ class Login:
             try:
                 resp = await get_qrcode_login_result(auth_code)
                 auth = Auth()
-                auth.access_token = resp["token_info"]["access_token"]
-                auth.refresh_token = resp["token_info"]["refresh_token"]
+                auth.data = auth.refresh_handler(resp)
                 return await auth.refresh()
             except ResponseCodeError as e:
                 if e.code != 86039:
